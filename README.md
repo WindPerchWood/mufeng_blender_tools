@@ -1,6 +1,6 @@
 # mufeng_blender_tools
 
-Blender 插件合集（木风工具箱），全部通过 N 面板「MF Tools」标签页使用。
+Blender 插件合集，全部通过 N 面板「MF Tools」标签页使用。
 
 
 ## 反馈与联系
