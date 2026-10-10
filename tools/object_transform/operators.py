@@ -25,7 +25,11 @@ OP_ID = f"mf.{TOOL_ID.lower()}_set"
 UNPARENT_OP_ID = "mf.rotmode_unparent"
 SINGLE_USER_OP_ID = "mf.rotmode_single_user"
 APPLY_TRS_OP_ID = "mf.rotmode_apply_transform"
+CLEAR_EMPTIES_OP_ID = "mf.rotmode_clear_empties"
 WM_ATTR = "mf_rotmode"
+
+IGNORED_KEYS = {"mf_id", "_RNA_UI"}
+ALL_OBJECT_COLLECTIONS = {"objects"}
 
 ROT_MODES = (
     ('XYZ', "XYZ 欧拉", "按 X→Y→Z 顺序旋转"),
@@ -155,8 +159,156 @@ class MF_OT_RotMode_ApplyTransform(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _is_property_group(value):
+    return isinstance(value, bpy.types.PropertyGroup)
+
+
+def _collect(holder, out, depth=0):
+    if holder is None or depth > 3:
+        return
+    try:
+        holder_ptr = holder.as_pointer()
+    except Exception:
+        holder_ptr = 0
+    for prop in holder.bl_rna.properties:
+        if prop.type == 'POINTER':
+            try:
+                value = getattr(holder, prop.identifier, None)
+            except Exception:
+                continue
+            if isinstance(value, bpy.types.Object):
+                if value.as_pointer() != holder_ptr:
+                    out.add(value.as_pointer())
+            elif _is_property_group(value):
+                _collect(value, out, depth + 1)
+        elif prop.type == 'COLLECTION' and prop.identifier not in ALL_OBJECT_COLLECTIONS:
+            try:
+                items = list(getattr(holder, prop.identifier))
+            except Exception:
+                continue
+            for item in items:
+                if isinstance(item, bpy.types.Object):
+                    if item.as_pointer() != holder_ptr:
+                        out.add(item.as_pointer())
+                elif _is_property_group(item):
+                    _collect(item, out, depth + 1)
+
+
+def _driver_objects(out):
+    holders = list(bpy.data.objects) + list(bpy.data.scenes) + list(bpy.data.materials)
+    for holder in holders:
+        anim = getattr(holder, "animation_data", None)
+        if anim is None:
+            continue
+        for curve in anim.drivers:
+            for var in curve.driver.variables:
+                for target in var.targets:
+                    if isinstance(target.id, bpy.types.Object):
+                        out.add(target.id.as_pointer())
+
+
+def _node_group_objects(out):
+    for group in bpy.data.node_groups:
+        for item in group.interface.items_tree:
+            value = getattr(item, "default_value", None)
+            if isinstance(value, bpy.types.Object):
+                out.add(value.as_pointer())
+
+
+def referenced_pointers(context):
+    out = set()
+    for obj in bpy.data.objects:
+        _collect(obj, out)
+        for con in obj.constraints:
+            _collect(con, out)
+        for mod in obj.modifiers:
+            _collect(mod, out)
+        _collect(getattr(obj.data, "dof", None), out)
+    _node_group_objects(out)
+    _driver_objects(out)
+    _collect(getattr(context, "scene", None), out)
+    _collect(getattr(context, "window_manager", None), out)
+    prefs = getattr(context, "preferences", None)
+    if prefs is not None:
+        for entry in prefs.addons:
+            try:
+                _collect(getattr(entry, "preferences", None), out)
+            except Exception:
+                continue
+    return out
+
+
+def collect_clearable_empties(context):
+    used = referenced_pointers(context)
+    targets = []
+    skipped = {"children": 0, "referenced": 0, "linked": 0}
+    for obj in context.scene.objects:
+        if obj.type != 'EMPTY':
+            continue
+        if obj.library is not None:
+            skipped["linked"] += 1
+            continue
+        if len(obj.children) > 0:
+            skipped["children"] += 1
+            continue
+        if obj.as_pointer() in used:
+            skipped["referenced"] += 1
+            continue
+        targets.append(obj)
+    return targets, skipped
+
+
+def _skip_text(skipped):
+    parts = []
+    labels = (("children", "有子级"), ("referenced", "被引用"), ("linked", "来自链接库"))
+    for key, label in labels:
+        if skipped.get(key):
+            parts.append("%s %d" % (label, skipped[key]))
+    return "，".join(parts)
+
+
+def op_clear_empties(context):
+    targets, skipped = collect_clearable_empties(context)
+    suffix = _skip_text(skipped)
+    if not targets:
+        message = "没有可清除的空物体"
+        if suffix:
+            message += "（跳过 " + suffix + "）"
+        return 'CANCELLED', message
+
+    with_data = 0
+    for obj in targets:
+        if set(obj.keys()) - IGNORED_KEYS:
+            with_data += 1
+
+    for obj in targets:
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+    message = "已清除空物体 %d 个" % len(targets)
+    if suffix:
+        message += "，跳过 " + suffix
+    if with_data:
+        message += "；其中 %d 个带自定义数据已一并删除" % with_data
+    return 'FINISHED', message
+
+
+class MF_OT_RotMode_ClearEmpties(bpy.types.Operator):
+    bl_idname = CLEAR_EMPTIES_OP_ID
+    bl_label = "清除空物体"
+    bl_description = ("删除空物体。只删没有子物体、且没有被任何约束 / 修改器 / 驱动 / 相机对焦 / "
+                      "工具参数引用到的空物体，有子级或被引用的一律跳过；可 Ctrl+Z 撤销")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        status, message = op_clear_empties(context)
+        if message:
+            self.report({'INFO'} if status == 'FINISHED' else {'WARNING'}, message)
+        return {status}
+
+
 classes = (MF_PG_RotModeSettings, MF_OT_RotMode_Set, MF_OT_RotMode_Unparent,
-           MF_OT_RotMode_SingleUser, MF_OT_RotMode_ApplyTransform)
+           MF_OT_RotMode_SingleUser, MF_OT_RotMode_ApplyTransform,
+           MF_OT_RotMode_ClearEmpties)
 
 
 def register():
