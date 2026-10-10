@@ -244,6 +244,15 @@ def t_auto(c, m):
     m._cancel_timer()
     for name, func in zip(m.HANDLER_NAMES, m.HANDLER_FUNCS):
         c.eq(getattr(bpy.app.handlers, name).count(func), 1, "重复 attach 不叠加：%s" % name)
+        c.ok("_bpy_persistent" in func.__dict__, "钩子带 @persistent：%s" % name)
+
+    m._cancel_timer()
+    m._STATE["pending"] = True
+    m._STATE["count"] = -1
+    m._on_depsgraph()
+    c.ok(bpy.app.timers.is_registered(m._run),
+         "排队标志与定时器脱节时自愈（旧代码会永久僵死，再也不补号）")
+    m._cancel_timer()
 
     m._STATE["count"] = len(bpy.data.objects)
     m._on_depsgraph()
@@ -592,6 +601,13 @@ def t_conventions(c):
     c.ok("load_post" in src["operators.py"], "打开文件有兜底")
     c.ok("save_pre" in src["operators.py"], "保存前有兜底")
     c.ok("bpy.app.timers.register" in src["operators.py"], "补号延到定时器里做")
+    c.ok("from bpy.app.handlers import persistent" in src["operators.py"],
+         "钩子用 bpy.app.handlers.persistent 标记")
+    c.eq(src["operators.py"].count("@persistent"), 3,
+         "三个钩子各戴一个 @persistent（否则打开文件就被 Blender 清光）")
+    c.ok("persistent=True" in src["operators.py"], "补号定时器跨文件加载也存活")
+    c.ok("bpy.app.timers.is_registered(_run)" in src["operators.py"],
+         "排队标志按定时器实际情况自愈，不会假排队僵死")
     c.ok("timers.unregister(_run)" in src["operators.py"],
          "取消定时器按函数名注销（5.2 的 register 不返回句柄）")
     c.ok("session_uid" in src["operators.py"],
@@ -640,6 +656,54 @@ def t_registration(c, m, uimod, root, external):
     again.ids_input = ""
 
 
+def t_reload(c, m):
+    c.section("打开 .blend 后钩子仍在（@persistent 回归）")
+
+    objs = [make_object("重载%d" % i) for i in range(3)]
+    path = os.path.join(tempfile.gettempdir(), "id_select_selftest_reload.blend")
+    if os.path.exists(path):
+        os.remove(path)
+
+    m.detach()
+    try:
+        for obj in objs:
+            if m.ID_PROP in obj:
+                del obj[m.ID_PROP]
+        c.ok(all(m.id_of(o) is None for o in objs),
+             "存盘前清掉 ID（模拟工程文件里本来就没有号）")
+        bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+        saved = True
+    except Exception as exc:
+        c.ok(False, "无法生成测试文件", repr(exc))
+        saved = False
+    finally:
+        m.attach()
+    if not saved:
+        return
+
+    bpy.ops.wm.open_mainfile(filepath=path)
+
+    c.ok(all("_bpy_persistent" in f.__dict__ for f in m.HANDLER_FUNCS),
+         "打开文件后三个钩子没被 Blender 清掉")
+    c.ok(m._on_load in bpy.app.handlers.load_post, "load_post 上还挂着打开文件的兜底")
+    c.ok(m._on_depsgraph in bpy.app.handlers.depsgraph_update_post, "depsgraph 上还挂着监控")
+    c.ok(m._on_save in bpy.app.handlers.save_pre, "save_pre 上还挂着保存前兜底")
+    c.eq(m._STATE["count"], -1, "打开文件后物体数缓存作废，会重算")
+    c.ok(bpy.app.timers.is_registered(m._run),
+         "已经排好一次补号（定时器跨文件加载也存活）")
+
+    m._cancel_timer()
+    m._run()
+    ids = [m.id_of(o) for o in bpy.data.objects]
+    c.ok(bool(ids) and all(v is not None for v in ids),
+         "打开文件后场景里所有物体都补上了 ID", ids)
+
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def main():
     print("=" * 72)
     print("id_select 子工具自检  |  Blender %s" % bpy.app.version_string)
@@ -671,6 +735,7 @@ def main():
         ("面板绘制", lambda: t_panel_draw(c, m, uimod)),
         ("工具箱约定", lambda: t_conventions(c)),
         ("注册 / 注销往返", lambda: t_registration(c, m, uimod, root, external)),
+        ("打开文件后仍工作", lambda: t_reload(c, m)),
     )
 
     for label, fn in groups:
