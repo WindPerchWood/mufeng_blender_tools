@@ -1,6 +1,7 @@
 import re
 
 import bpy
+from bpy.app.handlers import persistent
 from bpy.props import PointerProperty, StringProperty
 
 try:
@@ -274,16 +275,17 @@ def _run():
 
 
 def _schedule():
-    if _STATE["pending"]:
+    if _STATE["pending"] and bpy.app.timers.is_registered(_run):
         return
     _STATE["pending"] = True
     try:
-        bpy.app.timers.register(_run, first_interval=FIX_DELAY)
+        bpy.app.timers.register(_run, first_interval=FIX_DELAY, persistent=True)
     except Exception:
         _STATE["pending"] = False
         _run()
 
 
+@persistent
 def _on_depsgraph(*args):
     if _STATE["busy"]:
         return
@@ -292,11 +294,13 @@ def _on_depsgraph(*args):
     _schedule()
 
 
+@persistent
 def _on_load(*args):
     _STATE["count"] = -1
     _schedule()
 
 
+@persistent
 def _on_save(*args):
     if _STATE["busy"]:
         return
