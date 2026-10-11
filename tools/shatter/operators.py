@@ -41,6 +41,14 @@ GRID_MAX_CELLS = 5000
 SHATTER_WARN_PARTS = 150
 SHATTER_MAX_PARTS = 500
 
+SKIN_MM = 1.0
+SKIN_OPEN_RATIO = 0.5
+WELD_DIST = 1e-6
+SKIN_DESC = ("切开前先给模型加一层 1 毫米厚的皮，切出来的碎块才有实体截面。"
+             "\n只在模型是零厚度面片（开口边超过一半）时才真正加厚，"
+             "本来就是实心闭合的模型不会被改动。"
+             "\n代价：碎块面数约 3.6 倍，切割会慢一些。")
+
 
 def target_object(context):
     try:
@@ -55,7 +63,24 @@ def target_object(context):
     return selected[0]
 
 
-def source_bmesh(context, obj):
+def source_is_flat(me):
+    if me is None:
+        return False
+    faces = list(me.polygons)
+    if not faces:
+        return False
+    if not me.has_custom_normals:
+        return not any(p.use_smooth for p in faces)
+    step = max(1, len(faces) // 200)
+    for p in faces[::step]:
+        normal = p.normal
+        for li in p.loop_indices:
+            if normal.dot(me.corner_normals[li].vector) < 0.998:
+                return False
+    return True
+
+
+def source_bmesh(context, obj, skin=False):
     me = None
     try:
         dg = context.evaluated_depsgraph_get()
@@ -68,13 +93,31 @@ def source_bmesh(context, obj):
 
     bm = bmesh.new()
     if me is not None:
+        flat = source_is_flat(me)
         bm.from_mesh(me)
         mats = list(me.materials)
         bpy.data.meshes.remove(me)
     else:
+        flat = source_is_flat(obj.data)
         bm.from_mesh(obj.data)
         mats = list(obj.data.materials)
-    return bm, mats
+
+    bm, welded = weld_source(bm)
+    if welded:
+        utils.report("INFO", f"{obj.name} 顶点未焊接，已自动焊接成闭合实体")
+
+    if skin:
+        if not needs_skin(bm):
+            utils.report("INFO", f"{obj.name} 已是闭合实体，未加厚")
+        else:
+            thickness = skin_thickness(context)
+            if add_skin(bm, thickness):
+                utils.report("INFO",
+                             f"{obj.name} 零厚度面片，已加厚 {SKIN_MM:g} 毫米"
+                             f"（{thickness:.6g} 个单位）")
+            else:
+                utils.report("WARNING", f"{obj.name} 加厚未生效，按原网格切割")
+    return bm, mats, flat
 
 
 def bounds_of(bm):
@@ -85,6 +128,56 @@ def bounds_of(bm):
     zs = [v.co.z for v in bm.verts]
     return (Vector((min(xs), min(ys), min(zs))),
             Vector((max(xs), max(ys), max(zs))))
+
+
+def skin_thickness(context):
+    try:
+        scale = context.scene.unit_settings.scale_length
+    except Exception:
+        scale = 1.0
+    if not scale or scale <= 0.0:
+        scale = 1.0
+    return (SKIN_MM * 0.001) / scale
+
+
+def open_edges(bm):
+    return sum(1 for e in bm.edges if len(e.link_faces) < 2)
+
+
+def weld_source(bm):
+    if not bm.faces or open_edges(bm) == 0:
+        return bm, False
+    probe = bm.copy()
+    try:
+        bmesh.ops.remove_doubles(probe, verts=list(probe.verts), dist=WELD_DIST)
+    except Exception as exc:
+        utils.report("WARNING", f"焊接探测失败，按原网格切割: {exc}")
+        probe.free()
+        return bm, False
+    if open_edges(probe) == 0:
+        bm.free()
+        return probe, True
+    probe.free()
+    return bm, False
+
+
+def needs_skin(bm):
+    edges = len(bm.edges)
+    if not bm.faces or edges == 0:
+        return False
+    return open_edges(bm) > edges * SKIN_OPEN_RATIO
+
+
+def add_skin(bm, thickness):
+    faces = list(bm.faces)
+    if not faces or thickness <= 0.0:
+        return False
+    try:
+        bmesh.ops.solidify(bm, geom=faces, thickness=thickness)
+    except Exception as exc:
+        utils.report("WARNING", f"加厚失败，按原网格切割: {exc}")
+        return False
+    return True
 
 
 def piece_collection(obj, context):
@@ -105,10 +198,20 @@ def hide_object(obj):
         pass
 
 
-def new_piece(name, bm, src, mats, coll):
+def new_piece(name, bm, src, mats, coll, flat=False):
+    if flat:
+        for f in bm.faces:
+            f.smooth = False
     me = bpy.data.meshes.new(name)
     bm.to_mesh(me)
     me.update()
+    if flat:
+        attr = me.attributes.get("custom_normal")
+        if attr is not None:
+            try:
+                me.attributes.remove(attr)
+            except Exception:
+                pass
     for mat in mats:
         try:
             me.materials.append(mat)
@@ -192,8 +295,8 @@ def _select_only(context, pieces):
         pass
 
 
-def run_grid_cut(context, obj, sx, sy, sz, hide_original=True):
-    src_bm, mats = source_bmesh(context, obj)
+def run_grid_cut(context, obj, sx, sy, sz, hide_original=True, skin=False):
+    src_bm, mats, flat = source_bmesh(context, obj, skin)
     if bounds_of(src_bm) is None:
         src_bm.free()
         return []
@@ -250,7 +353,7 @@ def run_grid_cut(context, obj, sx, sy, sz, hide_original=True):
                     name = f"{base}_{axis_hits[0]}{n}"
                 else:
                     name = f"{base}_{i + 1}_{j + 1}_{k + 1}"
-                pieces.append(new_piece(name, bm, obj, mats, coll))
+                pieces.append(new_piece(name, bm, obj, mats, coll, flat))
                 bm.free()
 
     _progress_end(context)
@@ -298,7 +401,7 @@ def gen_seeds(bm, count, rng, min_sep):
 
 
 def run_random_fracture(context, obj, count, seed=0, hide_original=True):
-    src_bm, mats = source_bmesh(context, obj)
+    src_bm, mats, flat = source_bmesh(context, obj)
     lo_hi = bounds_of(src_bm)
     if lo_hi is None:
         src_bm.free()
@@ -338,7 +441,7 @@ def run_random_fracture(context, obj, count, seed=0, hide_original=True):
             bm.free()
             continue
         bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
-        pieces.append(new_piece(f"{base}_{i + 1:03d}", bm, obj, mats, coll))
+        pieces.append(new_piece(f"{base}_{i + 1:03d}", bm, obj, mats, coll, flat))
         bm.free()
 
     _progress_end(context)
@@ -471,6 +574,8 @@ class MF_PG_ShatterSettings(bpy.types.PropertyGroup):
     hide_original: BoolProperty(name="隐藏原物体", default=True,
                                 description="切完后把源物体藏起来")
 
+    skin: BoolProperty(name="先加厚成实体", default=False, description=SKIN_DESC)
+
     show_preview: BoolProperty(name="预览分割线", default=False,
                                description="在物体包围盒上画出切割线",
                                update=_on_setting_changed)
@@ -486,6 +591,7 @@ class MF_OT_Shatter_Grid(bpy.types.Operator):
     segy: IntProperty(name="Y 分段", default=1, min=1, max=100)
     segz: IntProperty(name="Z 分段", default=1, min=1, max=100)
     hide_original: BoolProperty(name="隐藏原物体", default=True)
+    skin: BoolProperty(name="先加厚成实体", default=False, description=SKIN_DESC)
 
     def execute(self, context):
         obj = target_object(context)
@@ -510,7 +616,7 @@ class MF_OT_Shatter_Grid(bpy.types.Operator):
             props.show_preview = False
 
         pieces = run_grid_cut(context, obj, self.segx, self.segy, self.segz,
-                              self.hide_original)
+                              self.hide_original, self.skin)
         if not pieces:
             self.report({'WARNING'}, "没有切出任何碎块（物体包围盒为空？）")
             return {'CANCELLED'}
