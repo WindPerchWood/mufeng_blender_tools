@@ -90,6 +90,8 @@ class MF_PT_Shatter_Cut(utils.MF_ToolPanel):
         else:
             layout.label(text="把某一轴调到 2 以上才会切", icon='INFO')
 
+        layout.prop(props, "skin")
+
         row = layout.row()
         row.scale_y = 1.5
         op = row.operator(GRID_OP_ID, text="切割物体", icon='MOD_BOOLEAN')
@@ -97,6 +99,7 @@ class MF_PT_Shatter_Cut(utils.MF_ToolPanel):
         op.segy = props.segy
         op.segz = props.segz
         op.hide_original = props.hide_original
+        op.skin = props.skin
         row.enabled = target is not None and 1 < cells <= GRID_MAX_CELLS
 
         layout.prop(props, "hide_original")
