@@ -16,8 +16,8 @@ class MF_PT_Keyconfig(utils.MF_ToolPanel):
     bl_options = {'DEFAULT_CLOSED'}
 
     MF_SEARCH_KEYWORDS = (
-        "jwfa", "jianwei", "keyconfig", "keymap", "key", "hotkey", "max",
-        "键位", "快捷键", "按键", "3dsmax",
+        "jwfa", "jianwei", "keyconfig", "keymap", "key", "hotkey", 
+        "键位", "快捷键", "按键", 
     )
 
     def draw_header(self, context):
