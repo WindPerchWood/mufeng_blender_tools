@@ -8,8 +8,8 @@ except (ImportError, ValueError):
                                   MF_ToolPanel=bpy.types.Panel)
 
 from .operators import (
-    GRID_MAX_CELLS,
     GRID_OP_ID,
+    GRID_SLOW_CELLS,
     RANDOM_OP_ID,
     SHATTER_WARN_PARTS,
     WM_ATTR,
@@ -84,9 +84,9 @@ class MF_PT_Shatter_Cut(utils.MF_ToolPanel):
 
         cells = props.segx * props.segy * props.segz
         if cells > 1:
-            over = cells > GRID_MAX_CELLS
-            layout.label(text=f"共 {cells} 块" + ("（超过上限，请调小）" if over else ""),
-                         icon='ERROR' if over else 'INFO')
+            slow = cells > GRID_SLOW_CELLS
+            layout.label(text=f"共 {cells} 块" + ("（块数很多，会算比较久）" if slow else ""),
+                         icon='ERROR' if slow else 'INFO')
         else:
             layout.label(text="把某一轴调到 2 以上才会切", icon='INFO')
 
@@ -100,7 +100,7 @@ class MF_PT_Shatter_Cut(utils.MF_ToolPanel):
         op.segz = props.segz
         op.hide_original = props.hide_original
         op.skin = props.skin
-        row.enabled = target is not None and 1 < cells <= GRID_MAX_CELLS
+        row.enabled = target is not None and 1 < cells
 
         layout.prop(props, "hide_original")
         layout.prop(props, "show_preview")
